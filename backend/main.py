@@ -1,71 +1,116 @@
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+import requests
+from io import BytesIO
 import os
-import uuid
-from typing import List, Optional
+from typing import Optional
 
 app = FastAPI()
 
 # Configure CORS
-origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"],  # Allow all origins (update this for production)
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
 )
 
-# Create static directory for uploaded files
-os.makedirs("static/uploads", exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Hugging Face API settings
+HF_API_URL = "https://api-inference.huggingface.co/models/openai/clip-vit-base-patch32"
+HF_API_TOKEN = os.getenv("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")  # Set your Hugging Face token in environment variables
 
-class ChatResponse(BaseModel):
-    text: str
-    image_url: Optional[str] = None
+headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
 
-def process_text(text: str):
-    """Example text processing function"""
-    return f"Processed text: {text} (This is a mock response)"
+async def analyze_image(image: UploadFile):
+    """
+    Analyze an image using Hugging Face's CLIP model.
+    Returns a description of the image.
+    """
+    try:
+        # Read the image file
+        image_content = await image.read()
+        image_bytes = BytesIO(image_content)
 
-def process_image(image_path: str):
-    """Example image processing function"""
-    return {"description": "This is a mock image description"}
+        # Send the image to Hugging Face's CLIP API
+        response = requests.post(
+            HF_API_URL,
+            headers=headers,
+            files={"file": image_bytes.getvalue()},
+            data={"inputs": "What is in this image? Provide details and history if relevant."},
+        )
 
-@app.post("/chat/", response_model=ChatResponse)
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail="Error from Hugging Face API")
+
+        # Extract the most relevant label and score
+        result = response.json()
+        if isinstance(result, list) and len(result) > 0:
+            best_match = result[0]  # Get the first result (most relevant)
+            return {
+                "label": best_match.get("label", "Unknown"),
+                "score": best_match.get("score", 0),
+                "description": f"This is a {best_match.get('label', 'object')} with a confidence score of {best_match.get('score', 0):.2f}."
+            }
+        else:
+            return {"description": "No relevant information found for this image."}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error analyzing image: {str(e)}")
+
+async def analyze_text(text: str):
+    """
+    Analyze text using Hugging Face's CLIP model.
+    Returns a description or relevant information about the text.
+    """
+    try:
+        # Send the text to Hugging Face's CLIP API
+        response = requests.post(
+            HF_API_URL,
+            headers=headers,
+            json={"inputs": text},
+        )
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail="Error from Hugging Face API")
+
+        # Extract the most relevant response
+        result = response.json()
+        if isinstance(result, list) and len(result) > 0:
+            best_match = result[0]  # Get the first result (most relevant)
+            return {
+                "label": best_match.get("label", "Unknown"),
+                "score": best_match.get("score", 0),
+                "description": f"This is about {best_match.get('label', 'the input')} with a confidence score of {best_match.get('score', 0):.2f}."
+            }
+        else:
+            return {"description": "No relevant information found for this text."}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error analyzing text: {str(e)}")
+
+@app.post("/chat/")
 async def chat_endpoint(
     text: Optional[str] = Form(None),
-    images: List[UploadFile] = File([])
+    images: list[UploadFile] = File([]),
 ):
+    """
+    Endpoint to handle chat requests.
+    Accepts text and/or images, processes them using CLIP, and returns responses.
+    """
     try:
-        # Process text input
-        text_response = process_text(text) if text else "No text provided"
+        responses = []
 
-        # Process images
-        image_responses = []
+        # Analyze text if provided
+        if text:
+            text_response = await analyze_text(text)
+            responses.append({"type": "text", "content": text_response})
+
+        # Analyze images if provided
         for image in images:
-            # Save uploaded image
-            file_ext = os.path.splitext(image.filename)[1]
-            filename = f"{uuid.uuid4()}{file_ext}"
-            file_path = f"static/uploads/{filename}"
-            
-            with open(file_path, "wb") as buffer:
-                buffer.write(await image.read())
-            
-            # Process image (replace with your actual image processing logic)
-            img_result = process_image(file_path)
-            image_responses.append(img_result)
+            image_response = await analyze_image(image)
+            responses.append({"type": "image", "content": image_response})
 
-        # Generate mock image response (replace with actual logic)
-        # In a real scenario, you might generate an image and save it to static
-        mock_image_url = "https://picsum.photos/200/300"  # Random example image
-
-        return {
-            "text": f"{text_response}. Received {len(images)} images.",
-            "image_url": mock_image_url
-        }
+        return {"responses": responses}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
